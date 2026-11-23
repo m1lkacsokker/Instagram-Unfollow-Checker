@@ -12,14 +12,14 @@ Built with [`instagrapi`](https://github.com/subzeroid/instagrapi) following its
 
 - **Persistent Device & Session Settings (`data/session.json`):** Avoids suspicious fresh password logins on every run by persisting cookies and Android device UUIDs (`load_settings` / atomic `dump_settings` with `0600` permissions), validating sessions with `get_timeline_feed()`, and preserving device UUIDs via `set_uuids()` on re-authentication.
 - **ID-Based Diffing (No Rename False Positives):** Stores followers as `{"user_id": "username"}` in `data/followers_state.json`. If a follower changes their username, their handle is silently updated rather than reported as an unfollow.
-- **Pagination-Drop Protection (Zero False Positives):**
+- **Pagination-Drop Protection (Near-Zero False Positives):**
   - Merges `user_followers_v1` with `user_followers_private_gql` whenever Instagram's ranked v1 pagination returns fewer users than the profile's follower count.
-  - Verifies every candidate unfollower bidirectionally — via forward `search_followers`, `user_info_v1` (in case they renamed *and* were omitted), and reverse `search_following` on the candidate's own following list — before sending any unfollow alert.
-  - Aborts safely if Instagram returns a severely truncated or empty response.
+  - Verifies every candidate unfollower bidirectionally — via forward `search_followers`, `user_info_v1` (detecting handle renames and labeling deleted/deactivated accounts as `(deactivated/deleted)`), and reverse `search_following` on the candidate's own following list — before sending any unfollow alert.
+  - Applies a **2-run confirmation** (`data/pending_unfollows.json`) for unverifiable private accounts that cannot be reverse-checked, and aborts safely if Instagram returns a severely truncated or empty response.
 - **Desktop PC Rate-Limit & Sleep Safeguards:**
-  - Enforces a **20-hour cooldown** via `data/last_run.txt` (bypassable with `--force`) so waking/rebooting your PC never spams Instagram.
+  - Enforces a **20-hour cooldown** via `data/last_run.txt` (bypassable with `--force`) and a non-blocking process lock (`data/checker.lock`) to prevent overlapping runs.
   - Adds a **10–45 second randomized startup delay** and `delay_range = [1, 3]` between API calls.
-- **Notifications & Health Alerts:** Sends unfollow alerts and high-priority failure alerts (`ChallengeRequired`, `TwoFactorRequired`, `FeedbackRequired`, `RateLimitError`, `LoginRequired`, etc.) to `NTFY_URL` and optional `DISCORD_WEBHOOK_URL`.
+- **Notifications & Health Alerts:** Sends unfollow alerts (distinguishing normal unfollows from `(deactivated/deleted)` accounts) and high-priority failure alerts (`ChallengeRequired`, `TwoFactorRequired`, `FeedbackRequired`, `RateLimitError`, `LoginRequired`, etc.) to `NTFY_URL` (with optional `NTFY_TOKEN` Bearer auth) and optional `DISCORD_WEBHOOK_URL`.
 - **Rotating Logs:** Automatically logs runs, handle renames, errors, and unfollows to `data/checker.log` (2 MiB max, 5 rotated backups).
 
 ---
@@ -34,10 +34,12 @@ Built with [`instagrapi`](https://github.com/subzeroid/instagrapi) following its
 ├── .gitignore          # Excludes .venv/, .env, and data/
 ├── LICENSE             # MIT License
 └── data/               # Created automatically at runtime (gitignored)
-    ├── session.json         # Saved instagrapi session & device settings (0600)
-    ├── followers_state.json # Baseline follower snapshot {user_id: username}
-    ├── last_run.txt         # UTC ISO timestamp of last successful run
-    └── checker.log          # Rotating log file
+    ├── session.json           # Saved instagrapi session & device settings (0600)
+    ├── followers_state.json   # Baseline follower snapshot {user_id: username}
+    ├── pending_unfollows.json # Unverifiable private misses awaiting 2nd-run confirmation
+    ├── last_run.txt           # UTC ISO timestamp of last successful run
+    ├── checker.lock           # Process lock preventing overlapping runs
+    └── checker.log            # Rotating log file
 ```
 
 ---
@@ -74,6 +76,9 @@ TARGET_USERNAME=target_account_username
 
 # Push notification endpoint (e.g., https://ntfy.sh/your-private-topic-name)
 NTFY_URL=https://ntfy.sh/your-secret-ig-topic
+
+# Optional ntfy access token for private/self-hosted ntfy topics (Bearer auth; leave blank if unused)
+NTFY_TOKEN=
 
 # Optional Discord webhook URL (leave blank to disable)
 DISCORD_WEBHOOK_URL=
@@ -148,6 +153,7 @@ Description=Run Instagram Unfollow Checker once daily with missed-run catch-up
 [Timer]
 OnCalendar=daily
 Persistent=true
+RandomizedDelaySec=15m
 Unit=ig-unfollow-checker.service
 
 [Install]
@@ -189,6 +195,17 @@ Register-ScheduledTask `
 ```
 
 Using `pythonw.exe` runs silently in the background with no console window popup, and `-StartWhenAvailable` catches up missed runs after boot or wake.
+
+---
+
+## Known Limitations (Instagram API Constraints)
+
+Because Instagram's private API is unofficial and intentionally restricts automated scraping, a few limitations cannot be fully solved in client code:
+
+- **Partial follower lists from third-party viewers:** Instagram's server-side `should_limit_list_of_followers` and "Flagged for review / potential spam" filters can withhold ~5–15% of followers from *any* paginated API response viewed by a burner account. Merging `v1` + private GraphQL and preserving verified followers in `followers_state.json` gradually improves coverage, but if Instagram never exposes a particular follower in pagination, the script cannot detect if that account unfollows before ever being seen.
+- **Temporary deactivation vs. permanent deletion:** Instagram returns `UserNotFound` for both temporarily deactivated and permanently deleted accounts. The alert labels them `(deactivated/deleted)`, as there is no API way to tell them apart until an account reactivates.
+- **2-run confirmation delay for unverifiable private followers:** If a **private** account (not followed by your burner) is omitted by both `followers/` and forward `search_followers`, Instagram blocks inspecting their `following` list (`PrivateAccount`). To prevent false alarms, those rare cases wait for a second consecutive missed run (~48h) before alerting. Public unfollows and deleted/deactivated accounts still alert immediately.
+- **Account challenges & soft blocks:** Even with persistent device UUIDs and human-like request delays, Instagram may occasionally trigger `ChallengeRequired`, `FeedbackRequired`, or rate limits — especially on newly created burner accounts, VPN/datacenter IPs, or after repeated `--force` runs.
 
 ---
 

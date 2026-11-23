@@ -16,6 +16,7 @@ instagrapi best practices:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -23,11 +24,22 @@ import random
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:  # POSIX
+    msvcrt = None  # type: ignore[assignment]
 
 import requests
 from dotenv import load_dotenv
@@ -39,13 +51,16 @@ ENV_FILE = BASE_DIR / ".env"
 DATA_DIR = BASE_DIR / "data"
 SESSION_FILE = DATA_DIR / "session.json"
 STATE_FILE = DATA_DIR / "followers_state.json"
+PENDING_FILE = DATA_DIR / "pending_unfollows.json"
 LAST_RUN_FILE = DATA_DIR / "last_run.txt"
+LOCK_FILE = DATA_DIR / "checker.lock"
 LOG_FILE = DATA_DIR / "checker.log"
 
 COOLDOWN_HOURS = 20
 STARTUP_DELAY_MIN_SECONDS = 10
 STARTUP_DELAY_MAX_SECONDS = 45
 REQUEST_DELAY_RANGE = [1, 3]
+PRIVATE_UNVERIFIED_MISS_THRESHOLD = 2
 HTTP_TIMEOUT_SECONDS = 15
 
 PLACEHOLDER_VALUES = {
@@ -67,13 +82,22 @@ class Config:
     ntfy_url: str
     discord_webhook_url: str
     proxy_url: str
+    ntfy_token: str = ""
 
 
 @dataclass(frozen=True)
 class DiffResult:
     unfollowed: list[str]
+    unfollowed_entries: list[tuple[str, str]]  # (user_id, username)
     new_followers: list[str]
     renamed: list[tuple[str, str, str]]  # (user_id, old_username, new_username)
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    followers: dict[str, str]
+    deactivated_ids: set[str]
+    pending_unfollows: dict[str, dict[str, Any]]
 
 
 def setup_logging() -> None:
@@ -124,6 +148,7 @@ def load_config() -> Config:
         ntfy_url=os.getenv("NTFY_URL", "").strip(),
         discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
         proxy_url=os.getenv("PROXY_URL", "").strip(),
+        ntfy_token=os.getenv("NTFY_TOKEN", "").strip(),
     )
 
 
@@ -167,6 +192,49 @@ def save_session_atomic(cl: Client) -> None:
     serialized = json.dumps(settings, indent=4, ensure_ascii=False) + "\n"
     write_text_atomic(SESSION_FILE, serialized)
     restrict_file_permissions(SESSION_FILE)
+
+
+@contextlib.contextmanager
+def acquire_run_lock() -> Iterator[bool]:
+    """Acquire a non-blocking process lock (data/checker.lock) to prevent overlapping runs."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    lock_handle = open(LOCK_FILE, "a+", encoding="utf-8")
+    locked = False
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except BlockingIOError:
+                locked = False
+        elif msvcrt is not None:
+            try:
+                lock_handle.seek(0)
+                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+                locked = True
+            except OSError:
+                locked = False
+        else:
+            locked = True
+
+        if locked:
+            lock_handle.seek(0)
+            lock_handle.truncate()
+            lock_handle.write(f"{os.getpid()}\n")
+            lock_handle.flush()
+
+        yield locked
+    finally:
+        if locked:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    lock_handle.seek(0)
+                    msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        lock_handle.close()
 
 
 def read_last_run() -> datetime | None:
@@ -262,6 +330,8 @@ def send_notifications(
         }
         if tags:
             headers["Tags"] = ",".join(tags)
+        if config.ntfy_token and not is_placeholder(config.ntfy_token):
+            headers["Authorization"] = f"Bearer {config.ntfy_token}"
         try:
             response = requests.post(
                 config.ntfy_url,
@@ -348,7 +418,7 @@ def _login_with_optional_2fa(
             raise
 
 
-def login_user(config: Config, allow_interactive: bool = False, force_relogin: bool = False) -> Client:
+def login_user(config: Config, allow_interactive: bool = False) -> Client:
     """Authenticate using instagrapi's official best-practice session reuse pattern.
 
     1. Load persisted settings (cookies + device UUIDs) from data/session.json if present.
@@ -367,68 +437,60 @@ def login_user(config: Config, allow_interactive: bool = False, force_relogin: b
 
     if SESSION_FILE.exists():
         logger.info("Loading saved instagrapi session from %s...", SESSION_FILE)
-        session_data = cl.load_settings(SESSION_FILE)
+        cl.load_settings(SESSION_FILE)
 
-        if force_relogin:
-            # Preserve device UUIDs even when forcing a fresh login via --init-session
-            old_uuids = session_data.get("uuids") if isinstance(session_data, dict) else None
-            cl.set_settings({})
-            if old_uuids:
-                cl.set_uuids(old_uuids)
-                logger.info("Preserved existing device UUIDs for fresh login.")
-        else:
+        try:
+            cl.login(config.bot_username, config.bot_password)
+
+            # Smoke-test the loaded session using a lightweight authenticated call
             try:
-                cl.login(config.bot_username, config.bot_password)
-
-                # Smoke-test the loaded session using a lightweight authenticated call
-                try:
-                    cl.get_timeline_feed()
-                except ig_exc.LoginRequired:
-                    logger.warning(
-                        "Saved session expired during timeline smoke test; "
-                        "re-logging in while preserving device UUIDs..."
-                    )
-                    old_session = cl.get_settings()
-                    cl.set_settings({})
-                    if "uuids" in old_session:
-                        cl.set_uuids(old_session["uuids"])
-                    _login_with_optional_2fa(
-                        cl,
-                        config.bot_username,
-                        config.bot_password,
-                        allow_interactive=allow_interactive,
-                    )
-
-                save_session_atomic(cl)
-                logger.info("Authenticated @%s using persisted session.", config.bot_username)
-                login_via_session = True
-            except (
-                ig_exc.ChallengeRequired,
-                ig_exc.CaptchaChallengeRequired,
-                ig_exc.ChallengeSelfieCaptcha,
-                ig_exc.RecaptchaChallengeForm,
-                ig_exc.TwoFactorRequired,
-                ig_exc.FeedbackRequired,
-                ig_exc.PleaseWaitFewMinutes,
-                ig_exc.RateLimitError,
-                ig_exc.SentryBlock,
-                ig_exc.AccountSuspended,
-                ig_exc.BadPassword,
-                ig_exc.BadCredentials,
-                ig_exc.ProxyAddressIsBlocked,
-            ):
-                # Do NOT hammer Instagram with a second password login on security/rate blocks
-                raise
-            except Exception as exc:
+                cl.get_timeline_feed()
+            except ig_exc.LoginRequired:
                 logger.warning(
-                    "Could not reuse saved session (%s); falling back to password login "
-                    "with preserved device UUIDs.",
-                    exc,
+                    "Saved session expired during timeline smoke test; "
+                    "re-logging in while preserving device UUIDs..."
                 )
                 old_session = cl.get_settings()
-                cl = create_client(config, allow_interactive=allow_interactive)
+                cl.set_settings({})
                 if "uuids" in old_session:
                     cl.set_uuids(old_session["uuids"])
+                _login_with_optional_2fa(
+                    cl,
+                    config.bot_username,
+                    config.bot_password,
+                    allow_interactive=allow_interactive,
+                )
+
+            save_session_atomic(cl)
+            logger.info("Authenticated @%s using persisted session.", config.bot_username)
+            login_via_session = True
+        except (
+            ig_exc.ChallengeRequired,
+            ig_exc.CaptchaChallengeRequired,
+            ig_exc.ChallengeSelfieCaptcha,
+            ig_exc.RecaptchaChallengeForm,
+            ig_exc.TwoFactorRequired,
+            ig_exc.FeedbackRequired,
+            ig_exc.PleaseWaitFewMinutes,
+            ig_exc.RateLimitError,
+            ig_exc.SentryBlock,
+            ig_exc.AccountSuspended,
+            ig_exc.BadPassword,
+            ig_exc.BadCredentials,
+            ig_exc.ProxyAddressIsBlocked,
+        ):
+            # Do NOT hammer Instagram with a second password login on security/rate blocks
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Could not reuse saved session (%s); falling back to password login "
+                "with preserved device UUIDs.",
+                exc,
+            )
+            old_session = cl.get_settings()
+            cl = create_client(config, allow_interactive=allow_interactive)
+            if "uuids" in old_session:
+                cl.set_uuids(old_session["uuids"])
 
     if not login_via_session:
         logger.info("Logging into burner account @%s via instagrapi...", config.bot_username)
@@ -454,6 +516,35 @@ def load_followers_state() -> dict[str, str] | None:
     return {str(uid): str(username) for uid, username in raw.items()}
 
 
+def load_pending_unfollows() -> dict[str, dict[str, Any]]:
+    """Load unverifiable private accounts awaiting 2-run confirmation from data/pending_unfollows.json."""
+    if not PENDING_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(PENDING_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read %s (%s); starting with empty pending map.", PENDING_FILE, exc)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for uid, entry in raw.items():
+        if isinstance(entry, dict) and isinstance(entry.get("misses"), int):
+            result[str(uid)] = entry
+    return result
+
+
+def save_pending_unfollows(pending: dict[str, dict[str, Any]]) -> None:
+    """Persist pending unfollows atomically, removing the file when empty."""
+    if pending:
+        write_json_atomic(PENDING_FILE, pending)
+    elif PENDING_FILE.exists():
+        try:
+            PENDING_FILE.unlink()
+        except OSError:
+            write_json_atomic(PENDING_FILE, {})
+
+
 def diff_followers(previous: dict[str, str], current: dict[str, str]) -> DiffResult:
     """Compare follower snapshots strictly by user_id to prevent rename false positives."""
     previous_ids = set(previous.keys())
@@ -463,7 +554,11 @@ def diff_followers(previous: dict[str, str], current: dict[str, str]) -> DiffRes
     new_ids = current_ids - previous_ids
     retained_ids = previous_ids & current_ids
 
-    unfollowed = sorted((previous[uid] for uid in unfollowed_ids), key=str.lower)
+    unfollowed_entries = sorted(
+        ((uid, previous[uid]) for uid in unfollowed_ids),
+        key=lambda item: item[1].lower(),
+    )
+    unfollowed = [handle for _, handle in unfollowed_entries]
     new_followers = sorted((current[uid] for uid in new_ids), key=str.lower)
     renamed = sorted(
         (
@@ -473,7 +568,12 @@ def diff_followers(previous: dict[str, str], current: dict[str, str]) -> DiffRes
         ),
         key=lambda item: item[1].lower(),
     )
-    return DiffResult(unfollowed=unfollowed, new_followers=new_followers, renamed=renamed)
+    return DiffResult(
+        unfollowed=unfollowed,
+        unfollowed_entries=unfollowed_entries,
+        new_followers=new_followers,
+        renamed=renamed,
+    )
 
 
 def fetch_current_followers(cl: Client, target_username: str) -> tuple[str, dict[str, str], int]:
@@ -513,13 +613,13 @@ def fetch_current_followers(cl: Client, target_username: str) -> tuple[str, dict
         )
         try:
             gql_users = cl.user_followers_private_gql(target_user_id, amount=0)
+            gql_unique = {str(user.pk): str(user.username) for user in gql_users}
             before = len(followers)
-            for user in gql_users:
-                followers[str(user.pk)] = str(user.username)
+            followers.update(gql_unique)
             added = len(followers) - before
             logger.info(
-                "Private GraphQL returned %d users (+%d newly recovered; total now %d/%d).",
-                len(gql_users),
+                "Private GraphQL returned %d unique users (+%d newly recovered; total now %d/%d).",
+                len(gql_unique),
                 added,
                 len(followers),
                 expected_count,
@@ -562,23 +662,38 @@ def verify_candidate_unfollowers(
     previous_followers: dict[str, str],
     current_followers: dict[str, str],
     expected_count: int,
-) -> dict[str, str]:
+    pending_unfollows: dict[str, dict[str, Any]] | None = None,
+) -> VerificationResult:
     """Double-check missing follower IDs bidirectionally to eliminate Instagram API omissions.
 
     Verification layers for each candidate missing from the paginated follower list:
       1. Forward search: search_followers(target_user_id, old_username)
       2. Handle lookup + forward search if renamed: user_info_v1(uid) -> search_followers(new_username)
+         (also detects deleted/deactivated accounts via UserNotFound)
       3. Reverse search: search_following(uid, target_username) — catches accounts that Instagram
          omits from the target's followers/ endpoint AND forward search_followers index.
+      4. 2-run confirmation for unverifiable private accounts: if a private account cannot be
+         reverse-checked (PrivateAccount), require PRIVATE_UNVERIFIED_MISS_THRESHOLD consecutive
+         misses before confirming an unfollow.
 
-    Returns an updated copy of current_followers with any verified still-following users restored.
+    Returns a VerificationResult with restored followers, deactivated IDs, and updated pending map.
     """
+    updated_pending: dict[str, dict[str, Any]] = {
+        uid: dict(entry)
+        for uid, entry in (pending_unfollows or {}).items()
+        if uid not in current_followers and uid in previous_followers
+    }
+
     candidate_ids = sorted(
         set(previous_followers.keys()) - set(current_followers.keys()),
         key=lambda uid: previous_followers[uid].lower(),
     )
     if not candidate_ids:
-        return dict(current_followers)
+        return VerificationResult(
+            followers=dict(current_followers),
+            deactivated_ids=set(),
+            pending_unfollows={},
+        )
 
     # Guard against severe API truncation (e.g. >25% missing while reported follower_count is intact)
     max_verify = max(30, int(len(previous_followers) * 0.25))
@@ -599,7 +714,9 @@ def verify_candidate_unfollowers(
         len(candidate_ids),
     )
     verified_followers = dict(current_followers)
+    deactivated_ids: set[str] = set()
     restored_count = 0
+    deferred_count = 0
 
     fatal_errors = (
         ig_exc.LoginRequired,
@@ -617,6 +734,7 @@ def verify_candidate_unfollowers(
             matched_username = _search_follower_by_id(cl, target_user_id, uid, old_username)
             if matched_username is not None:
                 verified_followers[uid] = matched_username
+                updated_pending.pop(uid, None)
                 restored_count += 1
                 logger.info(
                     "False unfollow prevented: @%s (ID %s) is STILL following (omitted by pagination).",
@@ -625,19 +743,28 @@ def verify_candidate_unfollowers(
                 )
                 continue
 
-            # Layer 2: Look up current profile info (detects deleted accounts & handle renames)
+            # Layer 2: Look up current profile info (detects deleted/deactivated accounts & renames)
             latest_username = old_username
+            user_info_failed = False
             try:
                 user_info = cl.user_info_v1(uid)
                 fetched_handle = str(user_info.username or "").strip()
                 if fetched_handle:
                     latest_username = fetched_handle
             except ig_exc.UserNotFound:
-                # Account deleted/deactivated -> confirmed no longer following
+                # Account deleted or temporarily deactivated -> confirmed gone immediately
+                deactivated_ids.add(uid)
+                updated_pending.pop(uid, None)
+                logger.info(
+                    "Account @%s (ID %s) not found (deactivated or deleted).",
+                    old_username,
+                    uid,
+                )
                 continue
             except fatal_errors:
                 raise
             except ig_exc.ClientError as exc:
+                user_info_failed = True
                 logger.warning(
                     "Could not look up current handle for ID %s (@%s): %s",
                     uid,
@@ -649,6 +776,7 @@ def verify_candidate_unfollowers(
                 matched_renamed = _search_follower_by_id(cl, target_user_id, uid, latest_username)
                 if matched_renamed is not None:
                     verified_followers[uid] = matched_renamed
+                    updated_pending.pop(uid, None)
                     restored_count += 1
                     logger.info(
                         "False unfollow prevented (renamed + omitted by pagination): "
@@ -663,6 +791,7 @@ def verify_candidate_unfollowers(
             try:
                 if _is_in_user_following(cl, uid, target_user_id, target_username):
                     verified_followers[uid] = latest_username
+                    updated_pending.pop(uid, None)
                     restored_count += 1
                     logger.info(
                         "False unfollow prevented (verified via reverse search_following): "
@@ -672,14 +801,66 @@ def verify_candidate_unfollowers(
                         target_username,
                     )
                     continue
-            except (ig_exc.PrivateAccount, ig_exc.ClientForbiddenError, ig_exc.UserNotFound):
-                # Private account not followed by burner (cannot inspect their following list)
-                pass
+                # Public (or burner-followed) account cleanly returned [] -> confirmed unfollow
+                updated_pending.pop(uid, None)
+            except (ig_exc.PrivateAccount, ig_exc.ClientForbiddenError):
+                # Cannot inspect private account's following list.
+                if user_info_failed:
+                    # We could not even verify if they renamed -> preserve conservatively
+                    verified_followers[uid] = old_username
+                    restored_count += 1
+                    logger.warning(
+                        "Preserving private account @%s (ID %s) because handle lookup failed transiently.",
+                        old_username,
+                        uid,
+                    )
+                    continue
+
+                # Layer 4: Require 2 consecutive misses for unverifiable private accounts
+                prev_entry = updated_pending.get(uid)
+                misses = (int(prev_entry["misses"]) + 1) if prev_entry else 1
+                if misses < PRIVATE_UNVERIFIED_MISS_THRESHOLD:
+                    updated_pending[uid] = {
+                        "username": latest_username,
+                        "misses": misses,
+                        "first_missed": (
+                            prev_entry["first_missed"]
+                            if prev_entry and "first_missed" in prev_entry
+                            else datetime.now(timezone.utc).isoformat()
+                        ),
+                    }
+                    verified_followers[uid] = latest_username
+                    deferred_count += 1
+                    logger.info(
+                        "Private account @%s (ID %s) could not be reverse-verified (miss %d/%d); "
+                        "deferring unfollow alert until confirmed on next run.",
+                        latest_username,
+                        uid,
+                        misses,
+                        PRIVATE_UNVERIFIED_MISS_THRESHOLD,
+                    )
+                    continue
+
+                # Missed on PRIVATE_UNVERIFIED_MISS_THRESHOLD consecutive runs -> confirmed unfollow
+                updated_pending.pop(uid, None)
+                logger.info(
+                    "Private account @%s (ID %s) missed %d consecutive runs; confirming unfollow.",
+                    latest_username,
+                    uid,
+                    misses,
+                )
+            except ig_exc.UserNotFound:
+                deactivated_ids.add(uid)
+                updated_pending.pop(uid, None)
             except fatal_errors:
                 raise
             except ig_exc.ClientError as exc:
+                # Transient reverse-lookup error: preserve conservatively to avoid false alert
+                verified_followers[uid] = latest_username
+                restored_count += 1
                 logger.warning(
-                    "Reverse search_following check skipped for @%s (ID %s): %s",
+                    "Reverse search_following failed transiently for @%s (ID %s): %s; "
+                    "preserving in state to avoid false alert.",
                     latest_username,
                     uid,
                     exc,
@@ -703,7 +884,16 @@ def verify_candidate_unfollowers(
             "Restored %d still-following account(s) omitted by Instagram.",
             restored_count,
         )
-    return verified_followers
+    if deferred_count:
+        logger.info(
+            "Deferred %d unverifiable private account(s) pending second consecutive miss.",
+            deferred_count,
+        )
+    return VerificationResult(
+        followers=verified_followers,
+        deactivated_ids=deactivated_ids,
+        pending_unfollows=updated_pending,
+    )
 
 
 def classify_instagram_error(exc: Exception) -> tuple[str, str]:
@@ -820,21 +1010,25 @@ def classify_instagram_error(exc: Exception) -> tuple[str, str]:
 
 def handle_init_session(config: Config) -> int:
     """Handle the --init-session interactive login & session persistence workflow."""
-    try:
-        login_user(config, allow_interactive=True, force_relogin=False)
-        logger.info(
-            "Session initialized and verified. Regular runs will reuse %s.",
-            SESSION_FILE,
-        )
-        return 0
-    except ig_exc.ClientError as exc:
-        title, body = classify_instagram_error(exc)
-        logger.error("%s | %s", title, exc)
-        send_notifications(config, title, body, priority="high", tags=["warning"])
-        return 1
-    except Exception as exc:
-        logger.exception("Failed to initialize session: %s", exc)
-        return 1
+    with acquire_run_lock() as acquired:
+        if not acquired:
+            logger.warning("Another checker.py instance is already running; aborting --init-session.")
+            return 1
+        try:
+            login_user(config, allow_interactive=True)
+            logger.info(
+                "Session initialized and verified. Regular runs will reuse %s.",
+                SESSION_FILE,
+            )
+            return 0
+        except ig_exc.ClientError as exc:
+            title, body = classify_instagram_error(exc)
+            logger.error("%s | %s", title, exc)
+            send_notifications(config, title, body, priority="high", tags=["warning"])
+            return 1
+        except Exception as exc:
+            logger.exception("Failed to initialize session: %s", exc)
+            return 1
 
 
 def handle_dry_run(config: Config) -> int:
@@ -847,6 +1041,7 @@ def handle_dry_run(config: Config) -> int:
         "BOT_PASSWORD": not is_placeholder(config.bot_password),
         "TARGET_USERNAME": not is_placeholder(config.target_username),
         "NTFY_URL": not is_placeholder(config.ntfy_url),
+        "NTFY_TOKEN (optional)": bool(config.ntfy_token and not is_placeholder(config.ntfy_token)),
         "DISCORD_WEBHOOK_URL (optional)": bool(
             config.discord_webhook_url and not is_placeholder(config.discord_webhook_url)
         ),
@@ -880,6 +1075,9 @@ def handle_dry_run(config: Config) -> int:
         logger.info("  Followers baseline               : none yet (%s)", STATE_FILE)
     else:
         logger.info("  Followers baseline               : %d followers (%s)", len(state), STATE_FILE)
+
+    pending = load_pending_unfollows()
+    logger.info("  Pending private unfollows        : %d", len(pending))
 
     last_run = read_last_run()
     if last_run is None:
@@ -938,113 +1136,142 @@ def handle_dry_run(config: Config) -> int:
 
 def run_check(config: Config, force: bool) -> int:
     """Run the daily Instagram follower check."""
-    if not check_cooldown(force=force):
-        return 0
-
-    delay = random.uniform(STARTUP_DELAY_MIN_SECONDS, STARTUP_DELAY_MAX_SECONDS)
-    logger.info(
-        "Applying randomized startup delay of %.1f seconds before contacting Instagram...",
-        delay,
-    )
-    time.sleep(delay)
-
-    try:
-        cl = login_user(config, allow_interactive=sys.stdin.isatty(), force_relogin=False)
-        target_user_id, current_followers, expected_count = fetch_current_followers(
-            cl, config.target_username
-        )
-
-        previous_followers = load_followers_state()
-
-        # Safeguard against silent empty responses when Instagram glitches
-        if previous_followers and not current_followers and expected_count > 0:
-            raise ig_exc.ClientError(
-                f"Instagram returned 0 followers even though @{config.target_username} "
-                f"reports {expected_count} followers. Aborting to prevent false unfollow alerts."
-            )
-
-        if previous_followers is None:
-            # Persist any refreshed session cookies/settings after a healthy run
-            save_session_atomic(cl)
-            write_json_atomic(STATE_FILE, current_followers)
-            record_last_run()
-            logger.info(
-                "Initialized baseline for @%s with %d followers in %s.",
-                config.target_username,
-                len(current_followers),
-                STATE_FILE,
-            )
+    with acquire_run_lock() as acquired:
+        if not acquired:
+            logger.info("Another checker.py instance is already running; exiting cleanly.")
             return 0
 
-        # Double-check every candidate unfollower bidirectionally (forward search_followers
-        # + reverse search_following) to eliminate Instagram omissions before diffing/saving.
-        current_followers = verify_candidate_unfollowers(
-            cl,
-            target_user_id=target_user_id,
-            target_username=config.target_username,
-            previous_followers=previous_followers,
-            current_followers=current_followers,
-            expected_count=expected_count,
+        if not check_cooldown(force=force):
+            return 0
+
+        delay = random.uniform(STARTUP_DELAY_MIN_SECONDS, STARTUP_DELAY_MAX_SECONDS)
+        logger.info(
+            "Applying randomized startup delay of %.1f seconds before contacting Instagram...",
+            delay,
         )
+        time.sleep(delay)
 
-        # Persist any refreshed session cookies/settings after a healthy run
-        save_session_atomic(cl)
-
-        diff = diff_followers(previous_followers, current_followers)
-
-        for uid, old_handle, new_handle in diff.renamed:
-            logger.info(
-                "Follower changed handle (ID %s): @%s -> @%s (updated without unfollow alert)",
-                uid,
-                old_handle,
-                new_handle,
+        try:
+            cl = login_user(config, allow_interactive=sys.stdin.isatty())
+            target_user_id, current_followers, expected_count = fetch_current_followers(
+                cl, config.target_username
             )
 
-        write_json_atomic(STATE_FILE, current_followers)
-        record_last_run()
+            previous_followers = load_followers_state()
 
-        if diff.unfollowed:
-            handles_list = "\n".join(f"- @{handle}" for handle in diff.unfollowed)
-            logger.info(
-                "Detected %d unfollower(s) on @%s: %s",
-                len(diff.unfollowed),
-                config.target_username,
-                ", ".join(f"@{h}" for h in diff.unfollowed),
-            )
-            title = f"IG Unfollow Alert (@{config.target_username}): {len(diff.unfollowed)} unfollowed"
-            body = (
-                f"Unfollowers detected ({len(diff.unfollowed)}):\n"
-                f"{handles_list}\n\n"
-                f"Current followers: {len(current_followers)} "
-                f"(+{len(diff.new_followers)} new, {len(diff.renamed)} renamed)"
-            )
-            send_notifications(config, title, body, priority="default", tags=["eyes"])
-        else:
-            logger.info(
-                "No unfollowers detected for @%s (total: %d, new: %d, renamed: %d).",
-                config.target_username,
-                len(current_followers),
-                len(diff.new_followers),
-                len(diff.renamed),
-            )
+            # Safeguard against silent empty responses when Instagram glitches
+            if previous_followers and not current_followers and expected_count > 0:
+                raise ig_exc.ClientError(
+                    f"Instagram returned 0 followers even though @{config.target_username} "
+                    f"reports {expected_count} followers. Aborting to prevent false unfollow alerts."
+                )
 
-        return 0
+            if previous_followers is None:
+                # Persist any refreshed session cookies/settings after a healthy run
+                save_session_atomic(cl)
+                write_json_atomic(STATE_FILE, current_followers)
+                save_pending_unfollows({})
+                record_last_run()
+                logger.info(
+                    "Initialized baseline for @%s with %d followers in %s.",
+                    config.target_username,
+                    len(current_followers),
+                    STATE_FILE,
+                )
+                return 0
 
-    except ig_exc.ClientError as exc:
-        title, body = classify_instagram_error(exc)
-        logger.error("%s | %s", title, exc)
-        send_notifications(config, title, body, priority="high", tags=["warning"])
-        return 1
-    except Exception as exc:
-        logger.exception("Unexpected error during follower check: %s", exc)
-        send_notifications(
-            config,
-            title="IG Checker Alert: Unexpected Error",
-            message=f"An unexpected error occurred in checker.py:\n\n{type(exc).__name__}: {exc}",
-            priority="high",
-            tags=["warning"],
-        )
-        return 1
+            # Double-check every candidate unfollower bidirectionally (forward search_followers
+            # + reverse search_following + 2-run confirmation for unverifiable private accounts).
+            verification = verify_candidate_unfollowers(
+                cl,
+                target_user_id=target_user_id,
+                target_username=config.target_username,
+                previous_followers=previous_followers,
+                current_followers=current_followers,
+                expected_count=expected_count,
+                pending_unfollows=load_pending_unfollows(),
+            )
+            current_followers = verification.followers
+
+            # Persist any refreshed session cookies/settings after a healthy run
+            save_session_atomic(cl)
+
+            diff = diff_followers(previous_followers, current_followers)
+
+            for uid, old_handle, new_handle in diff.renamed:
+                logger.info(
+                    "Follower changed handle (ID %s): @%s -> @%s (updated without unfollow alert)",
+                    uid,
+                    old_handle,
+                    new_handle,
+                )
+
+            write_json_atomic(STATE_FILE, current_followers)
+            save_pending_unfollows(verification.pending_unfollows)
+            record_last_run()
+
+            if diff.unfollowed_entries:
+                formatted_lines = [
+                    (
+                        f"- @{handle} (deactivated/deleted)"
+                        if uid in verification.deactivated_ids
+                        else f"- @{handle}"
+                    )
+                    for uid, handle in diff.unfollowed_entries
+                ]
+                handles_list = "\n".join(formatted_lines)
+                log_summary = ", ".join(
+                    (
+                        f"@{handle} [deactivated/deleted]"
+                        if uid in verification.deactivated_ids
+                        else f"@{handle}"
+                    )
+                    for uid, handle in diff.unfollowed_entries
+                )
+                logger.info(
+                    "Detected %d unfollower(s) on @%s: %s",
+                    len(diff.unfollowed_entries),
+                    config.target_username,
+                    log_summary,
+                )
+                title = (
+                    f"IG Unfollow Alert (@{config.target_username}): "
+                    f"{len(diff.unfollowed_entries)} unfollowed"
+                )
+                body = (
+                    f"Unfollowers detected ({len(diff.unfollowed_entries)}):\n"
+                    f"{handles_list}\n\n"
+                    f"Current followers: {len(current_followers)} "
+                    f"(+{len(diff.new_followers)} new, {len(diff.renamed)} renamed)"
+                )
+                send_notifications(config, title, body, priority="default", tags=["eyes"])
+            else:
+                logger.info(
+                    "No unfollowers detected for @%s (total: %d, new: %d, renamed: %d, pending: %d).",
+                    config.target_username,
+                    len(current_followers),
+                    len(diff.new_followers),
+                    len(diff.renamed),
+                    len(verification.pending_unfollows),
+                )
+
+            return 0
+
+        except ig_exc.ClientError as exc:
+            title, body = classify_instagram_error(exc)
+            logger.error("%s | %s", title, exc)
+            send_notifications(config, title, body, priority="high", tags=["warning"])
+            return 1
+        except Exception as exc:
+            logger.exception("Unexpected error during follower check: %s", exc)
+            send_notifications(
+                config,
+                title="IG Checker Alert: Unexpected Error",
+                message=f"An unexpected error occurred in checker.py:\n\n{type(exc).__name__}: {exc}",
+                priority="high",
+                tags=["warning"],
+            )
+            return 1
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
