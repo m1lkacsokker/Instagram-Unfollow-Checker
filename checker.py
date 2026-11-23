@@ -544,14 +544,32 @@ def _search_follower_by_id(cl: Client, target_user_id: str, uid: str, query: str
     return None
 
 
+def _is_in_user_following(
+    cl: Client,
+    candidate_uid: str,
+    target_user_id: str,
+    target_username: str,
+) -> bool:
+    """Return True if target_user_id appears in candidate_uid's following list."""
+    matches = cl.search_following(candidate_uid, target_username)
+    return any(str(user.pk) == target_user_id for user in matches)
+
+
 def verify_candidate_unfollowers(
     cl: Client,
     target_user_id: str,
+    target_username: str,
     previous_followers: dict[str, str],
     current_followers: dict[str, str],
     expected_count: int,
 ) -> dict[str, str]:
-    """Double-check missing follower IDs via search_followers to eliminate pagination false positives.
+    """Double-check missing follower IDs bidirectionally to eliminate Instagram API omissions.
+
+    Verification layers for each candidate missing from the paginated follower list:
+      1. Forward search: search_followers(target_user_id, old_username)
+      2. Handle lookup + forward search if renamed: user_info_v1(uid) -> search_followers(new_username)
+      3. Reverse search: search_following(uid, target_username) — catches accounts that Instagram
+         omits from the target's followers/ endpoint AND forward search_followers index.
 
     Returns an updated copy of current_followers with any verified still-following users restored.
     """
@@ -577,15 +595,25 @@ def verify_candidate_unfollowers(
         )
 
     logger.info(
-        "Verifying %d candidate unfollower(s) via search_followers to rule out pagination drops...",
+        "Verifying %d candidate unfollower(s) via forward & reverse search to rule out Instagram omissions...",
         len(candidate_ids),
     )
     verified_followers = dict(current_followers)
     restored_count = 0
 
+    fatal_errors = (
+        ig_exc.LoginRequired,
+        ig_exc.ClientLoginRequired,
+        ig_exc.ChallengeRequired,
+        ig_exc.FeedbackRequired,
+        ig_exc.PleaseWaitFewMinutes,
+        ig_exc.RateLimitError,
+    )
+
     for uid in candidate_ids:
         old_username = previous_followers[uid]
         try:
+            # Layer 1: Forward search on target's followers list by old handle
             matched_username = _search_follower_by_id(cl, target_user_id, uid, old_username)
             if matched_username is not None:
                 verified_followers[uid] = matched_username
@@ -597,21 +625,17 @@ def verify_candidate_unfollowers(
                 )
                 continue
 
-            # If not found by old handle, check whether they renamed AND were dropped by pagination
+            # Layer 2: Look up current profile info (detects deleted accounts & handle renames)
+            latest_username = old_username
             try:
                 user_info = cl.user_info_v1(uid)
-                new_username = str(user_info.username or "").strip()
+                fetched_handle = str(user_info.username or "").strip()
+                if fetched_handle:
+                    latest_username = fetched_handle
             except ig_exc.UserNotFound:
                 # Account deleted/deactivated -> confirmed no longer following
                 continue
-            except (
-                ig_exc.LoginRequired,
-                ig_exc.ClientLoginRequired,
-                ig_exc.ChallengeRequired,
-                ig_exc.FeedbackRequired,
-                ig_exc.PleaseWaitFewMinutes,
-                ig_exc.RateLimitError,
-            ):
+            except fatal_errors:
                 raise
             except ig_exc.ClientError as exc:
                 logger.warning(
@@ -620,10 +644,9 @@ def verify_candidate_unfollowers(
                     old_username,
                     exc,
                 )
-                new_username = ""
 
-            if new_username and new_username.lower() != old_username.lower():
-                matched_renamed = _search_follower_by_id(cl, target_user_id, uid, new_username)
+            if latest_username.lower() != old_username.lower():
+                matched_renamed = _search_follower_by_id(cl, target_user_id, uid, latest_username)
                 if matched_renamed is not None:
                     verified_followers[uid] = matched_renamed
                     restored_count += 1
@@ -636,14 +659,33 @@ def verify_candidate_unfollowers(
                     )
                     continue
 
-        except (
-            ig_exc.LoginRequired,
-            ig_exc.ClientLoginRequired,
-            ig_exc.ChallengeRequired,
-            ig_exc.FeedbackRequired,
-            ig_exc.PleaseWaitFewMinutes,
-            ig_exc.RateLimitError,
-        ):
+            # Layer 3: Reverse search on the candidate's own following list for target_username
+            try:
+                if _is_in_user_following(cl, uid, target_user_id, target_username):
+                    verified_followers[uid] = latest_username
+                    restored_count += 1
+                    logger.info(
+                        "False unfollow prevented (verified via reverse search_following): "
+                        "@%s (ID %s) STILL follows @%s.",
+                        latest_username,
+                        uid,
+                        target_username,
+                    )
+                    continue
+            except (ig_exc.PrivateAccount, ig_exc.ClientForbiddenError, ig_exc.UserNotFound):
+                # Private account not followed by burner (cannot inspect their following list)
+                pass
+            except fatal_errors:
+                raise
+            except ig_exc.ClientError as exc:
+                logger.warning(
+                    "Reverse search_following check skipped for @%s (ID %s): %s",
+                    latest_username,
+                    uid,
+                    exc,
+                )
+
+        except fatal_errors:
             raise
         except ig_exc.ClientError as exc:
             # Conservative fallback: on transient lookup errors, preserve user to avoid false alert
@@ -658,7 +700,7 @@ def verify_candidate_unfollowers(
 
     if restored_count:
         logger.info(
-            "Restored %d still-following account(s) omitted by Instagram pagination.",
+            "Restored %d still-following account(s) omitted by Instagram.",
             restored_count,
         )
     return verified_followers
@@ -934,11 +976,12 @@ def run_check(config: Config, force: bool) -> int:
             )
             return 0
 
-        # Double-check every candidate unfollower via search_followers to eliminate
-        # Instagram's ranked pagination drops before diffing or saving state.
+        # Double-check every candidate unfollower bidirectionally (forward search_followers
+        # + reverse search_following) to eliminate Instagram omissions before diffing/saving.
         current_followers = verify_candidate_unfollowers(
             cl,
             target_user_id=target_user_id,
+            target_username=config.target_username,
             previous_followers=previous_followers,
             current_followers=current_followers,
             expected_count=expected_count,

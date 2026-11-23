@@ -14,7 +14,7 @@ Built with [`instagrapi`](https://github.com/subzeroid/instagrapi) following its
 - **ID-Based Diffing (No Rename False Positives):** Stores followers as `{"user_id": "username"}` in `data/followers_state.json`. If a follower changes their username, their handle is silently updated rather than reported as an unfollow.
 - **Pagination-Drop Protection (Zero False Positives):**
   - Merges `user_followers_v1` with `user_followers_private_gql` whenever Instagram's ranked v1 pagination returns fewer users than the profile's follower count.
-  - Verifies every candidate unfollower against Instagram's follower search index (`search_followers`) — including checking `user_info_v1` in case a user renamed *and* was omitted by pagination — before sending any unfollow alert.
+  - Verifies every candidate unfollower bidirectionally — via forward `search_followers`, `user_info_v1` (in case they renamed *and* were omitted), and reverse `search_following` on the candidate's own following list — before sending any unfollow alert.
   - Aborts safely if Instagram returns a severely truncated or empty response.
 - **Desktop PC Rate-Limit & Sleep Safeguards:**
   - Enforces a **20-hour cooldown** via `data/last_run.txt` (bypassable with `--force`) so waking/rebooting your PC never spams Instagram.
